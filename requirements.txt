@@ -1,0 +1,5 @@
+pytelegrambotapi
+flask
+psutil
+requests
+python-dotenv
