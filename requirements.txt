@@ -1,5 +1,4 @@
-pytelegrambotapi
 flask
+werkzeug
 psutil
-requests
-python-dotenv
+gunicorn
