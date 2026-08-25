@@ -2,8 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-FireXDecoder - Hosting Panel
-Professional, production-ready deployment script.
+FireXDecoder - Hosting Panel with Supabase persistence
 All messages and comments are in English.
 """
 
@@ -30,24 +29,30 @@ from flask import (
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 
+# Supabase client
+from supabase import create_client, Client
+
 # ===========================================================================
-# Configuration
+# HARDCODED CONFIGURATION – REPLACE THESE!
 # ===========================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "854191")
-SECRET_KEY = os.environ.get("SECRET_KEY", os.urandom(32).hex())
-PORT = int(os.environ.get("PORT", 3522))
-DEBUG = os.environ.get("DEBUG", "false").lower() == "true"
+ADMIN_PASS = "854191"                     # your admin password
+SECRET_KEY = "87B356EEDB89E9D11835FEE58D5978AA"       # generate a random hex string (e.g. python -c "import os; print(os.urandom(32).hex())")
+PORT = int(os.environ.get("PORT", 5000))  # Render provides PORT
+DEBUG = False
 
-# FIX: Use a writable/executable location for virtual environments
+# Supabase credentials – REPLACE WITH YOUR ACTUAL VALUES
+SUPABASE_URL = "https://teafqnjvaliahsruhhde.supabase.co"
+SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRlYWZxbmp2YWxpYWhzcnVoaGRlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NzY2Mzc4MSwiZXhwIjoyMTAzMjM5NzgxfQ.T2Qu04Sn-CV6jJMu79dnOJJiR8fdCwnSPB6_EE0FLbw"
+
+# Folders (ephemeral on Render, but used for app extraction)
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 VENV_FOLDER = os.environ.get(
     "VENV_BASE",
     os.path.join(os.path.expanduser("~"), ".cache", "firexdecoder_venvs")
 )
 LOG_FOLDER = os.path.join(BASE_DIR, "logs")
-DB_FILE = os.path.join(BASE_DIR, "database.json")
 
 DEFAULT_CONFIG = {
     "max_concurrent_per_user": 3,
@@ -109,9 +114,12 @@ os.makedirs(VENV_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
 
 # ===========================================================================
-# Database
+# Supabase Client & Database Helpers
 # ===========================================================================
-DB_LOCK = threading.Lock()
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("Supabase credentials missing. Set SUPABASE_URL and SUPABASE_SERVICE_KEY.")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 def default_db():
     return {
@@ -123,58 +131,93 @@ def default_db():
         "config": DEFAULT_CONFIG.copy()
     }
 
-def load_db():
-    with DB_LOCK:
-        if not os.path.exists(DB_FILE):
-            data = default_db()
-            _write_db(data)
-            return data
+def ensure_table_exists():
+    """Create the app_state table if it doesn't exist."""
+    try:
+        # Try to select from the table – if it succeeds, it exists.
+        supabase.table("app_state").select("id").limit(1).execute()
+        logger.info("app_state table already exists.")
+        return
+    except Exception as e:
+        logger.warning("app_state table not found or error: %s", e)
+        # Attempt to create the table using exec_sql RPC (if enabled)
         try:
-            with open(DB_FILE, "r") as f:
-                data = json.load(f)
-        except Exception:
-            data = default_db()
-            _write_db(data)
+            sql = """
+            CREATE TABLE IF NOT EXISTS app_state (
+                id TEXT PRIMARY KEY DEFAULT 'main',
+                data JSONB NOT NULL,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            """
+            # Insert default data only if table is empty
+            default_data = json.dumps(default_db())
+            sql += f"INSERT INTO app_state (id, data) VALUES ('main', '{default_data}') ON CONFLICT (id) DO NOTHING;"
+            # Use the exec_sql RPC (requires pg_net extension and function to be created)
+            # Note: Supabase may not have exec_sql enabled by default; if it fails, we instruct the user.
+            result = supabase.rpc("exec_sql", {"query": sql}).execute()
+            logger.info("app_state table created via exec_sql.")
+            return
+        except Exception as ex:
+            logger.error("Could not create table automatically: %s", ex)
+            logger.error("Please manually create the table in Supabase SQL Editor using:")
+            logger.error("""
+CREATE TABLE IF NOT EXISTS app_state (
+    id TEXT PRIMARY KEY DEFAULT 'main',
+    data JSONB NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+INSERT INTO app_state (id, data) VALUES ('main', '{"users":{}, "admin_device_tokens":{}, "start_times":{}, "app_settings":{}, "public_tokens":{}, "config": {"max_concurrent_per_user":3, "max_concurrent_vip":10, "max_concurrent_global":25, "sleep_after_hours":4, "auto_wake_after_minutes":10, "request_baseline_per_min":30}}') ON CONFLICT (id) DO NOTHING;
+            """)
+            raise RuntimeError("app_state table missing and automatic creation failed. Please create it manually.")
+
+# Call this once at startup
+ensure_table_exists()
+
+def load_db():
+    """Load the whole state from Supabase."""
+    try:
+        resp = supabase.table("app_state").select("data").eq("id", "main").execute()
+        if resp.data and len(resp.data) > 0:
+            data = resp.data[0]["data"]
+            # Backfill missing keys
+            defaults = default_db()
+            for key, val in defaults.items():
+                if key not in data:
+                    data[key] = val
+            for key, val in defaults["config"].items():
+                if key not in data.get("config", {}):
+                    data["config"][key] = val
+            # Migrate old user entries (if any)
+            for uname, val in list(data.get("users", {}).items()):
+                if not isinstance(val, dict):
+                    pw = val
+                    if not (pw.startswith("pbkdf2:") or pw.startswith("scrypt:")):
+                        pw = generate_password_hash(pw)
+                    data["users"][uname] = {"pw_hash": pw, "vip": False, "created": int(time.time()*1000)}
             return data
-
-        defaults = default_db()
-        for key, val in defaults.items():
-            if key not in data:
-                data[key] = val
-        for key, val in defaults["config"].items():
-            if key not in data.get("config", {}):
-                data["config"][key] = val
-
-        for uname, val in list(data.get("users", {}).items()):
-            if not isinstance(val, dict):
-                pw = val
-                if not (pw.startswith("pbkdf2:") or pw.startswith("scrypt:")):
-                    pw = generate_password_hash(pw)
-                data["users"][uname] = {"pw_hash": pw, "vip": False, "created": int(time.time()*1000)}
-        return data
-
-def _write_db(data):
-    tmp = DB_FILE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, DB_FILE)
+        else:
+            # No row yet – create default
+            data = default_db()
+            save_db(data)
+            return data
+    except Exception as e:
+        logger.error(f"Supabase load error: {e}")
+        # Fallback to a fresh default
+        return default_db()
 
 def save_db(data):
-    with DB_LOCK:
-        _write_db(data)
-
-def get_config(db, key):
-    return db.get("config", {}).get(key, DEFAULT_CONFIG.get(key))
-
-def get_user_concurrency_limit(db, email):
-    user = db.get("users", {}).get(email, {})
-    if user.get("vip"):
-        return get_config(db, "max_concurrent_vip")
-    return get_config(db, "max_concurrent_per_user")
+    """Save the entire state to Supabase."""
+    try:
+        supabase.table("app_state").upsert({"id": "main", "data": data}, on_conflict="id").execute()
+    except Exception as e:
+        logger.error(f"Supabase save error: {e}")
+        raise
 
 # ===========================================================================
-# Security
+# Security, process tracking, activity, app settings, etc.
+# (All helpers are unchanged – they rely on load_db() and save_db())
 # ===========================================================================
+
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-\.]+$")
 EMAIL_RE = re.compile(r"^[A-Za-z0-9_.+\-]+@[A-Za-z0-9\-]+\.[A-Za-z0-9\-.]+$")
 
@@ -212,16 +255,10 @@ def register_failed_login(username):
 def reset_login_attempts(username):
     login_attempts[username] = {"count": 0, "locked_until": 0}
 
-# ===========================================================================
-# Process tracking
-# ===========================================================================
 processes = {}
 proc_meta = {}
 STATE_LOCK = threading.Lock()
 
-# ===========================================================================
-# Activity tracker
-# ===========================================================================
 class ActivityTracker:
     def __init__(self):
         self.windows = defaultdict(lambda: deque())
@@ -271,9 +308,6 @@ class ActivityTracker:
 
 activity = ActivityTracker()
 
-# ===========================================================================
-# App settings
-# ===========================================================================
 def app_settings_key(user, name):
     return f"{user}_{name}"
 
@@ -332,9 +366,6 @@ def trim_log_if_needed(log_path, max_bytes=500_000):
     except Exception:
         pass
 
-# ===========================================================================
-# Device fingerprint
-# ===========================================================================
 def assign_device(seed_key):
     rnd = random.Random(seed_key)
     return rnd.choice(DEVICE_POOL)
@@ -345,9 +376,6 @@ def device_env_vars(device):
         "BOT_DEVICE_PLATFORM": device["platform"],
     }
 
-# ===========================================================================
-# Validation
-# ===========================================================================
 def validate_python_file(path):
     try:
         py_compile.compile(path, doraise=True)
@@ -431,9 +459,6 @@ def validate_project(extract_dir):
         return {"ok": False, "entry": entry, "kind": kind, "problems": problems}
     return {"ok": True, "entry": entry, "kind": kind}
 
-# ===========================================================================
-# Smart dependency installation
-# ===========================================================================
 def venv_path_for(user, app_name):
     return safe_join(VENV_FOLDER, f"{user}__{app_name}")
 
@@ -475,7 +500,6 @@ def ensure_venv(venv_dir):
     if os.path.exists(python_bin):
         return python_bin
 
-    # FIX: Better error handling and fallback
     try:
         subprocess.run(
             ["python3", "-m", "venv", venv_dir],
@@ -620,9 +644,6 @@ def smart_install_node(extract_dir, log_callback):
         log_callback(f"npm install error: {e}")
         return {"ok": False, "error": str(e)}
 
-# ===========================================================================
-# App lifecycle
-# ===========================================================================
 def count_running_for_user(user):
     return sum(1 for (u, _), p in processes.items() if u == user and p.poll() is None)
 
@@ -728,9 +749,15 @@ def stop_app_process(user, name, db, manual=True):
         db["start_times"].pop(tkey, None)
         save_db(db)
 
-# ===========================================================================
-# Scheduler
-# ===========================================================================
+def get_config(db, key):
+    return db.get("config", {}).get(key, DEFAULT_CONFIG.get(key))
+
+def get_user_concurrency_limit(db, email):
+    user = db.get("users", {}).get(email, {})
+    if user.get("vip"):
+        return get_config(db, "max_concurrent_vip")
+    return get_config(db, "max_concurrent_per_user")
+
 def scheduler_loop():
     while True:
         try:
@@ -2215,5 +2242,4 @@ def admin_get_public_link(name):
 # ===========================================================================
 if __name__ == "__main__":
     ensure_scheduler()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=DEBUG)
+    app.run(host="0.0.0.0", port=PORT, debug=DEBUG)
