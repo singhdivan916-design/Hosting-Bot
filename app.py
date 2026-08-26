@@ -119,7 +119,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Supabase credentials missing.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-ensure_bucket_exists()
+
 
 def default_db():
     return {
@@ -263,6 +263,8 @@ def restore_app_if_missing(user_name, app_name):
         logger.error(f"❌ Failed to restore app {user_name}/{app_name}: {e}")
         import traceback
         logger.error(traceback.format_exc())
+
+ensure_bucket_exists()
 # ===========================================================================
 # Security, process tracking, activity, app settings, etc.
 # ===========================================================================
