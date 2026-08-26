@@ -45,7 +45,6 @@ DEBUG = False
 # Supabase credentials – REPLACE WITH YOUR ACTUAL VALUES
 SUPABASE_URL = "https://teafqnjvaliahsruhhde.supabase.co"
 SUPABASE_SERVICE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRlYWZxbmp2YWxpYWhzcnVoaGRlIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NzY2Mzc4MSwiZXhwIjoyMTAzMjM5NzgxfQ.T2Qu04Sn-CV6jJMu79dnOJJiR8fdCwnSPB6_EE0FLbw"
-
 # Folders (ephemeral on Render, but used for extraction)
 UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
 VENV_FOLDER = os.environ.get(
@@ -108,6 +107,7 @@ app.secret_key = SECRET_KEY
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB in bytes
+
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(VENV_FOLDER, exist_ok=True)
 os.makedirs(LOG_FOLDER, exist_ok=True)
@@ -248,9 +248,7 @@ def restore_all_apps():
 
 # ===========================================================================
 # Security, process tracking, activity, app settings, etc.
-# (All helpers are unchanged – they rely on load_db() and save_db())
 # ===========================================================================
-
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-\.]+$")
 EMAIL_RE = re.compile(r"^[A-Za-z0-9_.+\-]+@[A-Za-z0-9\-]+\.[A-Za-z0-9\-.]+$")
 
@@ -1602,13 +1600,12 @@ setInterval(() => { location.reload(); }, 60000);
 </html>'''
 
 # ===========================================================================
-# Flask routes
+# Flask routes – ALL routes MUST be present
 # ===========================================================================
 
 @app.before_request
 def _boot():
     ensure_scheduler()
-    # Ensure all apps are restored on first request
     if not hasattr(app, '_restored'):
         restore_all_apps()
         app._restored = True
@@ -1838,11 +1835,446 @@ def _do_upload(user_name, mark_unlimited=False):
         })
     return jsonify({'ok': True, 'app_name': app_name, 'entry': entry, 'kind': kind})
 
-# -------------------- Validation / Run / Stop / Delete / Toggles / Logs / Download --------------------
-# These routes are identical to your original – I'm not repeating them to keep the answer readable.
-# They are available in your existing code and work unchanged with the new DB/Storage.
+# -------------------- Run / Stop / Restart / Delete / Toggle / Logs / Download --------------------
+@app.route('/validate/<name>')
+def validate_app(name):
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'ok': False, 'error': 'Login required'}), 401
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid app name'}), 400
+    try:
+        _, extract_dir, _ = app_dirs(user_name, name)
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'Invalid path'}), 400
+    if not os.path.exists(extract_dir):
+        return jsonify({'ok': False, 'error': 'App not found'}), 404
+    return jsonify(validate_project(extract_dir))
 
-# ... (all other routes – exactly as in your current app.py, no changes needed)
+@app.route('/run/<name>')
+def run_app_route(name):
+    login_resp = require_login()
+    if login_resp:
+        return login_resp
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid app name'}), 400
+    db = load_db()
+    result = start_app_process(user_name, name, db)
+    if request.args.get('json') == '1':
+        return jsonify(result)
+    return redirect(url_for('index'))
+
+@app.route('/stop/<name>')
+def stop_app_route(name):
+    login_resp = require_login()
+    if login_resp:
+        return login_resp
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid app name'}), 400
+    db = load_db()
+    stop_app_process(user_name, name, db, manual=True)
+    activity.clear_pause(f'{user_name}_{name}')
+    if request.args.get('json') == '1':
+        return jsonify({'ok': True})
+    return redirect(url_for('index'))
+
+@app.route('/restart/<name>')
+def restart_app_route(name):
+    login_resp = require_login()
+    if login_resp:
+        return login_resp
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid app name'}), 400
+    db = load_db()
+    stop_app_process(user_name, name, db, manual=False)
+    time.sleep(0.5)
+    result = start_app_process(user_name, name, db)
+    if request.args.get('json') == '1':
+        return jsonify(result)
+    return redirect(url_for('index'))
+
+@app.route('/delete/<name>')
+def delete_app_route(name):
+    login_resp = require_login()
+    if login_resp:
+        return login_resp
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid app name'}), 400
+    db = load_db()
+    stop_app_process(user_name, name, db, manual=True)
+    app_dir, _, _ = app_dirs(user_name, name)
+    if os.path.exists(app_dir):
+        shutil.rmtree(app_dir, ignore_errors=True)
+    venv_dir = venv_path_for(user_name, name)
+    if os.path.exists(venv_dir):
+        shutil.rmtree(venv_dir, ignore_errors=True)
+    key = app_settings_key(user_name, name)
+    db.get('app_settings', {}).pop(key, None)
+    db.get('start_times', {}).pop(key, None)
+    save_db(db)
+    return redirect(url_for('index'))
+
+@app.route('/toggle_auto_on/<name>', methods=['POST'])
+def toggle_auto_on(name):
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'ok': False}), 401
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid app name'}), 400
+    db = load_db()
+    settings = get_app_settings(db, user_name, name)
+    settings['auto_on'] = not settings.get('auto_on', False)
+    save_db(db)
+    return jsonify({'ok': True, 'auto_on': settings['auto_on']})
+
+@app.route('/toggle_auto_restart/<name>', methods=['POST'])
+def toggle_auto_restart(name):
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'ok': False}), 401
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid app name'}), 400
+    db = load_db()
+    settings = get_app_settings(db, user_name, name)
+    settings['auto_restart'] = not settings.get('auto_restart', False)
+    save_db(db)
+    return jsonify({'ok': True, 'auto_restart': settings['auto_restart']})
+
+@app.route('/get_log/<name>')
+def get_log(name):
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'log': '', 'status': 'OFFLINE'}), 401
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'log': '', 'status': 'OFFLINE'}), 400
+    _, _, log_path = app_dirs(user_name, name)
+    log_content = ''
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            log_content = f.read()[-4000:]
+    p = processes.get((user_name, name))
+    db = load_db()
+    is_running = bool(p and p.poll() is None)
+    settings = get_app_settings(db, user_name, name)
+    return jsonify({
+        'log': log_content,
+        'status': 'RUNNING' if is_running else 'OFFLINE',
+        'start_time': db['start_times'].get(app_settings_key(user_name, name), 0),
+        'device': settings.get('device_platform')
+    })
+
+@app.route('/download/<name>')
+def download_app(name):
+    login_resp = require_login()
+    if login_resp:
+        return login_resp
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return 'Invalid app name', 400
+    _, extract_dir, _ = app_dirs(user_name, name)
+    if not os.path.exists(extract_dir):
+        return 'App not found', 404
+    memory_file = io.BytesIO()
+    with zipfile.ZipFile(memory_file, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(extract_dir):
+            dirs[:] = [d for d in dirs if d not in ('venv', '__pycache__', 'node_modules')]
+            for f in files:
+                fpath = os.path.join(root, f)
+                zf.write(fpath, os.path.relpath(fpath, extract_dir))
+    memory_file.seek(0)
+    return send_file(memory_file, download_name=f'{name}.zip', as_attachment=True)
+
+# -------------------- Public share links --------------------
+@app.route('/get_public_link/<name>', methods=['POST'])
+def get_public_link(name):
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'ok': False}), 401
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid name'}), 400
+    user_name = current_user_key()
+    _, extract_dir, _ = app_dirs(user_name, name)
+    if not os.path.exists(extract_dir):
+        return jsonify({'ok': False, 'error': 'App not found'}), 404
+    db = load_db()
+    token = ensure_public_token(db, user_name, name)
+    return jsonify({'ok': True, 'token': token, 'url': url_for('public_view', token=token, _external=True)})
+
+@app.route('/revoke_public_link/<name>', methods=['POST'])
+def revoke_public_link_route(name):
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'ok': False}), 401
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid name'}), 400
+    db = load_db()
+    revoke_public_token(db, current_user_key(), name)
+    return jsonify({'ok': True})
+
+def _lookup_public_token(token):
+    db = load_db()
+    tkey = db.get('public_tokens', {}).get(token)
+    if not tkey or '_' not in tkey:
+        return None, None, None
+    user, name = tkey.split('_', 1)
+    return db, user, name
+
+@app.route('/public/<token>')
+def public_view(token):
+    db, user, name = _lookup_public_token(token)
+    if not user:
+        return render_template_string(PUBLIC_HTML, valid=False, name=None, running=False, token=token)
+    p = processes.get((user, name))
+    running = bool(p and p.poll() is None)
+    return render_template_string(PUBLIC_HTML, valid=True, name=name, running=running, token=token)
+
+@app.route('/public/<token>/status')
+def public_status(token):
+    db, user, name = _lookup_public_token(token)
+    if not user:
+        return jsonify({'ok': False, 'error': 'Invalid or revoked link'}), 404
+    p = processes.get((user, name))
+    running = bool(p and p.poll() is None)
+    _, _, log_path = app_dirs(user, name)
+    log_content = ''
+    if os.path.exists(log_path):
+        with open(log_path, 'r', encoding='utf-8', errors='ignore') as f:
+            log_content = f.read()[-3000:]
+    return jsonify({'ok': True, 'running': running, 'log': log_content, 'name': name})
+
+@app.route('/public/<token>/start', methods=['POST'])
+def public_start(token):
+    db, user, name = _lookup_public_token(token)
+    if not user:
+        return jsonify({'ok': False, 'error': 'Invalid or revoked link'}), 404
+    result = start_app_process(user, name, db)
+    return jsonify(result)
+
+@app.route('/public/<token>/stop', methods=['POST'])
+def public_stop(token):
+    db, user, name = _lookup_public_token(token)
+    if not user:
+        return jsonify({'ok': False, 'error': 'Invalid or revoked link'}), 404
+    stop_app_process(user, name, db, manual=True)
+    return jsonify({'ok': True})
+
+# -------------------- File manager --------------------
+@app.route('/list_files/<name>')
+def list_files(name):
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'files': []}), 401
+    user_name = current_user_key()
+    if not is_safe_component(name):
+        return jsonify({'files': []}), 400
+    _, extract_dir, _ = app_dirs(user_name, name)
+    files = []
+    if os.path.exists(extract_dir):
+        for root, dirs, filenames in os.walk(extract_dir):
+            dirs[:] = [d for d in dirs if d not in ('venv', '__pycache__', 'node_modules', '.git')]
+            for f in filenames:
+                files.append(os.path.relpath(os.path.join(root, f), extract_dir))
+    return jsonify({'files': sorted(files)})
+
+def _resolve_project_file(user_name, project, filename):
+    if not is_safe_component(project):
+        raise ValueError('Invalid project name')
+    _, extract_dir, _ = app_dirs(user_name, project)
+    target = os.path.abspath(os.path.join(extract_dir, filename))
+    if not target.startswith(os.path.abspath(extract_dir) + os.sep) and target != os.path.abspath(extract_dir):
+        raise ValueError('Path traversal blocked')
+    return target
+
+@app.route('/read_file', methods=['POST'])
+def read_content():
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'content': ''}), 401
+    data = request.json or {}
+    try:
+        path = _resolve_project_file(current_user_key(), data.get('project', ''), data.get('filename', ''))
+    except ValueError as e:
+        return jsonify({'content': '', 'error': str(e)}), 400
+    if os.path.exists(path) and os.path.isfile(path):
+        try:
+            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                return jsonify({'content': f.read()})
+        except Exception as e:
+            return jsonify({'content': '', 'error': str(e)}), 500
+    return jsonify({'content': '', 'error': 'File not found'}), 404
+
+@app.route('/save_file', methods=['POST'])
+def save_content():
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'status': 'error'}), 401
+    data = request.json or {}
+    try:
+        path = _resolve_project_file(current_user_key(), data.get('project', ''), data.get('filename', ''))
+    except ValueError as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 400
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(data.get('content', ''))
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 500
+
+@app.route('/delete_file', methods=['POST'])
+def delete_file_api():
+    login_resp = require_login()
+    if login_resp:
+        return jsonify({'status': 'error'}), 401
+    data = request.json or {}
+    try:
+        path = _resolve_project_file(current_user_key(), data.get('project', ''), data.get('filename', ''))
+    except ValueError as e:
+        return jsonify({'status': 'error', 'error': str(e)}), 400
+    if os.path.exists(path):
+        os.remove(path)
+        return jsonify({'status': 'deleted'})
+    return jsonify({'status': 'error', 'error': 'File not found'}), 404
+
+# -------------------- Admin panel --------------------
+@app.route('/admin/panel')
+def admin_panel():
+    admin_resp = require_admin()
+    if admin_resp:
+        return admin_resp
+
+    db = load_db()
+    running_count = count_running_global()
+    try:
+        import psutil
+        ram_percent = psutil.virtual_memory().percent
+    except Exception:
+        ram_percent = 'N/A'
+
+    all_apps = []
+    admin_apps = []
+    if os.path.exists(UPLOAD_FOLDER):
+        for user in sorted(os.listdir(UPLOAD_FOLDER)):
+            user_dir = os.path.join(UPLOAD_FOLDER, user)
+            if not os.path.isdir(user_dir):
+                continue
+            for name in sorted(os.listdir(user_dir)):
+                if not os.path.isdir(os.path.join(user_dir, name)):
+                    continue
+                p = processes.get((user, name))
+                running = bool(p and p.poll() is None)
+                settings = get_app_settings(db, user, name)
+                entry = {
+                    'user': user, 'name': name, 'running': running,
+                    'device': settings.get('device_platform'),
+                    'auto_on': settings.get('auto_on'),
+                    'auto_restart': settings.get('auto_restart'),
+                }
+                if user == ADMIN_INTERNAL_ID:
+                    admin_apps.append(entry)
+                else:
+                    all_apps.append(entry)
+
+    users_list = [{'email': email, 'vip': rec.get('vip', False)} for email, rec in db.get('users', {}).items()]
+
+    return render_template_string(
+        ADMIN_HTML,
+        users=users_list,
+        config=db.get('config', DEFAULT_CONFIG),
+        running_count=running_count,
+        ram_percent=ram_percent,
+        all_apps=all_apps,
+        admin_apps=admin_apps
+    )
+
+@app.route('/admin/update_config', methods=['POST'])
+def admin_update_config():
+    admin_resp = require_admin()
+    if admin_resp:
+        return admin_resp
+    db = load_db()
+    cfg = db.setdefault('config', {})
+    for field, cast in [
+        ('max_concurrent_per_user', int),
+        ('max_concurrent_vip', int),
+        ('max_concurrent_global', int),
+        ('sleep_after_hours', float),
+        ('auto_wake_after_minutes', int)
+    ]:
+        val = request.form.get(field)
+        if val is not None:
+            try:
+                cfg[field] = cast(val)
+            except ValueError:
+                pass
+    save_db(db)
+    return redirect(url_for('admin_panel'))
+
+@app.route('/admin/toggle_vip', methods=['POST'])
+def admin_toggle_vip():
+    admin_resp = require_admin()
+    if admin_resp:
+        return jsonify({'ok': False}), 401
+    email = request.form.get('email', '').strip().lower()
+    db = load_db()
+    if email in db['users']:
+        db['users'][email]['vip'] = not db['users'][email].get('vip', False)
+        save_db(db)
+        return jsonify({'ok': True, 'vip': db['users'][email]['vip']})
+    return jsonify({'ok': False, 'error': 'User not found'}), 404
+
+@app.route('/admin/change_pw', methods=['POST'])
+def change_pw():
+    admin_resp = require_admin()
+    if admin_resp:
+        return admin_resp
+    email = request.form.get('email', '').strip().lower()
+    new_pw = request.form.get('new_pw', '').strip()
+    db = load_db()
+    if email in db['users'] and new_pw:
+        db['users'][email]['pw_hash'] = generate_password_hash(new_pw)
+        save_db(db)
+    return redirect(url_for('admin_panel'))
+
+@app.route('/admin/login_as/<path:email>')
+def login_as(email):
+    admin_resp = require_admin()
+    if admin_resp:
+        return admin_resp
+    db = load_db()
+    email = email.strip().lower()
+    if email not in db['users']:
+        return redirect(url_for('admin_panel'))
+    session['username'] = email
+    session['is_admin'] = False
+    session['user_folder'] = user_folder_id(email)
+    return redirect(url_for('index'))
+
+@app.route('/admin/upload_admin_app', methods=['POST'])
+def admin_upload_app():
+    admin_resp = require_admin()
+    if admin_resp:
+        return admin_resp
+    return _do_upload(ADMIN_INTERNAL_ID, mark_unlimited=True)
+
+@app.route('/admin/get_public_link/<name>', methods=['POST'])
+def admin_get_public_link(name):
+    admin_resp = require_admin()
+    if admin_resp:
+        return jsonify({'ok': False}), 401
+    if not is_safe_component(name):
+        return jsonify({'ok': False, 'error': 'Invalid name'}), 400
+    db = load_db()
+    token = ensure_public_token(db, ADMIN_INTERNAL_ID, name)
+    return jsonify({'ok': True, 'token': token, 'url': url_for('public_view', token=token, _external=True)})
 
 # ===========================================================================
 # Entry point
