@@ -196,32 +196,32 @@ def save_db(data):
 # ===========================================================================
 # Supabase Storage Helpers – for persistent app ZIPs
 # ===========================================================================
+# ===========================================================================
+# Supabase Storage Helpers – CORRECTED
+# ===========================================================================
 STORAGE_BUCKET = "apps"   # your bucket name
 
 def ensure_bucket_exists():
-    """Create the 'apps' bucket if it doesn't exist (using service role)."""
+    """Create the 'apps' bucket if it doesn't exist."""
     try:
-        # List buckets to check if 'apps' exists
-        buckets = supabase.storage().list_buckets()
+        # Use supabase.storage (not storage()) – attribute, not callable
+        buckets = supabase.storage.list_buckets()
         if not any(b['name'] == STORAGE_BUCKET for b in buckets):
-            supabase.storage().create_bucket(STORAGE_BUCKET, {"public": False})
+            supabase.storage.create_bucket(STORAGE_BUCKET, {"public": False})
             logger.info(f"Bucket '{STORAGE_BUCKET}' created.")
         else:
             logger.info(f"Bucket '{STORAGE_BUCKET}' already exists.")
     except Exception as e:
         logger.error(f"Failed to ensure bucket exists: {e}")
-        # Continue anyway – user might have created it manually
 
 def upload_app_zip(user_name, app_name, local_zip_path):
-    """Upload the original ZIP to Supabase Storage with robust error handling."""
+    """Upload the original ZIP to Supabase Storage."""
     remote_path = f"{user_name}/{app_name}/app.zip"
     try:
-        # Read file as bytes
         with open(local_zip_path, "rb") as f:
             file_data = f.read()
-        
-        # Upload bytes with content-type
-        supabase.storage().from_(STORAGE_BUCKET).upload(
+        # Correct: supabase.storage.from_ (not storage().from_)
+        supabase.storage.from_(STORAGE_BUCKET).upload(
             remote_path,
             file_data,
             {"content-type": "application/zip"}
@@ -236,34 +236,39 @@ def upload_app_zip(user_name, app_name, local_zip_path):
 
 def restore_app_if_missing(user_name, app_name):
     """Download and extract the ZIP from Supabase Storage if missing."""
-    app_dir, extract_dir, log_path = app_dirs(user_name, app_name)
+    _, extract_dir, _ = app_dirs(user_name, app_name)
     if os.path.exists(extract_dir) and os.listdir(extract_dir):
-        return  # already exists
+        return
 
     remote_path = f"{user_name}/{app_name}/app.zip"
     try:
-        # Download the ZIP from Supabase Storage
-        data = supabase.storage().from_(STORAGE_BUCKET).download(remote_path)
+        data = supabase.storage.from_(STORAGE_BUCKET).download(remote_path)
         if not data:
             logger.warning(f"No ZIP found in storage for {user_name}/{app_name}")
             return
-
-        # Save to a temporary file and extract
         os.makedirs(extract_dir, exist_ok=True)
         temp_zip = os.path.join(BASE_DIR, f"_restore_{user_name}_{app_name}.zip")
         with open(temp_zip, "wb") as f:
             f.write(data)
-
         with zipfile.ZipFile(temp_zip, 'r') as zf:
             zf.extractall(extract_dir)
         os.remove(temp_zip)
-
         logger.info(f"✅ Restored app {user_name}/{app_name} from Supabase Storage.")
     except Exception as e:
         logger.error(f"❌ Failed to restore app {user_name}/{app_name}: {e}")
         import traceback
         logger.error(traceback.format_exc())
 
+def restore_all_apps():
+    """Restore all apps that are missing from the filesystem."""
+    db = load_db()
+    for user_app_key in db.get("app_settings", {}).keys():
+        if "_" not in user_app_key:
+            continue
+        user, name = user_app_key.split("_", 1)
+        restore_app_if_missing(user, name)
+
+# Call this once to ensure the bucket exists
 ensure_bucket_exists()
 # ===========================================================================
 # Security, process tracking, activity, app settings, etc.
