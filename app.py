@@ -119,6 +119,7 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Supabase credentials missing.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+ensure_bucket_exists()
 
 def default_db():
     return {
@@ -197,20 +198,44 @@ def save_db(data):
 # ===========================================================================
 STORAGE_BUCKET = "apps"   # your bucket name
 
+def ensure_bucket_exists():
+    """Create the 'apps' bucket if it doesn't exist (using service role)."""
+    try:
+        # List buckets to check if 'apps' exists
+        buckets = supabase.storage().list_buckets()
+        if not any(b['name'] == STORAGE_BUCKET for b in buckets):
+            supabase.storage().create_bucket(STORAGE_BUCKET, {"public": False})
+            logger.info(f"Bucket '{STORAGE_BUCKET}' created.")
+        else:
+            logger.info(f"Bucket '{STORAGE_BUCKET}' already exists.")
+    except Exception as e:
+        logger.error(f"Failed to ensure bucket exists: {e}")
+        # Continue anyway – user might have created it manually
+
 def upload_app_zip(user_name, app_name, local_zip_path):
-    """Upload the original ZIP to Supabase Storage."""
+    """Upload the original ZIP to Supabase Storage with robust error handling."""
     remote_path = f"{user_name}/{app_name}/app.zip"
     try:
+        # Read file as bytes
         with open(local_zip_path, "rb") as f:
-            supabase.storage().from_(STORAGE_BUCKET).upload(remote_path, f, {"content-type": "application/zip"})
-        logger.info(f"Uploaded {remote_path} to Supabase Storage.")
+            file_data = f.read()
+        
+        # Upload bytes with content-type
+        supabase.storage().from_(STORAGE_BUCKET).upload(
+            remote_path,
+            file_data,
+            {"content-type": "application/zip"}
+        )
+        logger.info(f"✅ Uploaded {remote_path} to Supabase Storage.")
         return True
     except Exception as e:
-        logger.error(f"Failed to upload ZIP to Supabase: {e}")
+        logger.error(f"❌ Failed to upload ZIP to Supabase: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return False
 
 def restore_app_if_missing(user_name, app_name):
-    """Check if the extracted folder exists; if not, download the ZIP from Supabase Storage and extract it."""
+    """Download and extract the ZIP from Supabase Storage if missing."""
     app_dir, extract_dir, log_path = app_dirs(user_name, app_name)
     if os.path.exists(extract_dir) and os.listdir(extract_dir):
         return  # already exists
@@ -233,19 +258,11 @@ def restore_app_if_missing(user_name, app_name):
             zf.extractall(extract_dir)
         os.remove(temp_zip)
 
-        logger.info(f"Restored app {user_name}/{app_name} from Supabase Storage.")
+        logger.info(f"✅ Restored app {user_name}/{app_name} from Supabase Storage.")
     except Exception as e:
-        logger.error(f"Failed to restore app {user_name}/{app_name}: {e}")
-
-def restore_all_apps():
-    """On startup, iterate over all apps in the DB and restore missing ones."""
-    db = load_db()
-    for user_app_key in db.get("app_settings", {}).keys():
-        if "_" not in user_app_key:
-            continue
-        user, name = user_app_key.split("_", 1)
-        restore_app_if_missing(user, name)
-
+        logger.error(f"❌ Failed to restore app {user_name}/{app_name}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
 # ===========================================================================
 # Security, process tracking, activity, app settings, etc.
 # ===========================================================================
