@@ -1,5 +1,2 @@
 flask
-werkzeug
-psutil
 gunicorn
-supabase
